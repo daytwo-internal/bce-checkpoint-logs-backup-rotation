@@ -1,0 +1,11 @@
+JT - Backup Logs bceq-fw-smgt
+JT - Backup Logs bceq_SmartEventCP
+JT - Backup Logs bceqfw-mgt
+
+WF - Backup Logs Check Point to FTP
+
+ ├── JT - Backup Logs bceq-fw-smgt
+ ├── JT - Backup Logs bceq_SmartEventCP
+ └── JT - Backup Logs bceqfw-mgt
+
+ 

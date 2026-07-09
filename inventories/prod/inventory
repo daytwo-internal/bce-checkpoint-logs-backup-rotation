@@ -1,0 +1,17 @@
+[checkpoint_gye]
+bceq-fw-smgt ansible_host=172.18.46.5
+
+[checkpoint_uio]
+bceq_SmartEventCP ansible_host=172.23.46.55
+bceqfw-mgt        ansible_host=172.23.46.5
+
+[checkpoint_log_consoles:children]
+checkpoint_gye
+checkpoint_uio
+
+[checkpoint_log_consoles:vars]
+cp_log_dir=/opt/CPsuite-R82/fw1/log
+ftp_server=172.23.46.29
+ftp_remote_dir=/
+dry_run_delete=true
+delete_oldest_after_upload=true
