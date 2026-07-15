@@ -95,6 +95,8 @@
       register: ftp_list_command_file
       no_log: true
 
+###write y get existing files
+
     - name: Write FTP list commands
       ansible.builtin.copy:
         dest: "{{ ftp_list_command_file.path }}"
@@ -103,18 +105,9 @@
           user {{ ftp_user_effective }} {{ ftp_password_effective }}
           binary
           cd {{ ftp_remote_dir }}
-          ls {{ backup_date }}*
+          dir
           bye
       no_log: true
-
-#    - name: Get existing previous day files from FTP server
-#      ansible.builtin.shell: |
-#        ftp -inv "{{ ftp_server }}" < "{{ ftp_list_command_file.path }}" \
-#        | awk '/^{{ backup_date }}/ {print $0}'
-#      register: remote_existing_logs
-#      changed_when: false
-#      failed_when: false
-#      no_log: true
 
     - name: Get existing previous day files from FTP server
       ansible.builtin.shell: |
@@ -125,6 +118,13 @@
       register: remote_existing_logs
       changed_when: false
       failed_when: false
+
+    - name: Debug parsed FTP existing files
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          parsed_remote_files_count: "{{ remote_existing_logs.stdout_lines | default([]) | length }}"
+          parsed_remote_files: "{{ remote_existing_logs.stdout_lines | default([]) }}"
 
     - name: Debug raw FTP list output
       ansible.builtin.debug:
