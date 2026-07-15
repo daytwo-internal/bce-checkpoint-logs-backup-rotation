@@ -1,0 +1,319 @@
+---
+- name: Backup Check Point logs to FTP and delete oldest log day
+  hosts: checkpoint_log_consoles
+  gather_facts: false
+  become: false
+
+  vars:
+    # Fecha del día anterior en formato YYYY-MM-DD.
+    # Ejemplo: si hoy es 2026-07-09, backup_date será 2026-07-08.
+    backup_date: "{{ lookup('pipe', 'date -d yesterday +%F') }}"
+
+    # Ruta de logs en las consolas Check Point
+    cp_log_dir: "/opt/CPsuite-R82/fw1/log"
+
+    # Servidor FTP central
+    ftp_server: "172.23.46.29"
+    ftp_remote_dir: "/"
+
+    # Primero probar en true.
+    # En true: sube al FTP, identifica qué borraría, pero NO borra.
+    # En false: sube al FTP y borra la fecha más antigua.
+    dry_run_delete: true
+
+    # Controla si se ejecuta la lógica de borrado luego de FTP confirmado
+    delete_oldest_after_upload: true
+
+    # Credenciales FTP inyectadas desde AAP Credential Type
+    ftp_user_effective: "{{ lookup('env', 'CHKP_FTP_USER') }}"
+    ftp_password_effective: "{{ lookup('env', 'CHKP_FTP_PASSWORD') }}"
+
+  tasks:
+    - name: Show execution context
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          ansible_host: "{{ ansible_host | default(inventory_hostname) }}"
+          ansible_user: "{{ ansible_user | default('from AAP Machine Credential') }}"
+          cp_log_dir: "{{ cp_log_dir }}"
+          backup_date: "{{ backup_date }}"
+          ftp_server: "{{ ftp_server }}"
+          ftp_remote_dir: "{{ ftp_remote_dir }}"
+          dry_run_delete: "{{ dry_run_delete }}"
+          delete_oldest_after_upload: "{{ delete_oldest_after_upload }}"
+
+    - name: Validate FTP credentials from AAP
+      ansible.builtin.assert:
+        that:
+          - ftp_user_effective is defined
+          - ftp_user_effective | length > 0
+          - ftp_password_effective is defined
+          - ftp_password_effective | length > 0
+        fail_msg: >-
+          No llegaron las credenciales FTP desde AAP para {{ inventory_hostname }}.
+          Validar que el Job Template tenga asociada la credencial FTP correcta.
+        success_msg: "Credenciales FTP recibidas desde AAP para {{ inventory_hostname }}"
+      no_log: true
+
+    - name: Check Check Point log directory exists
+      ansible.builtin.stat:
+        path: "{{ cp_log_dir }}"
+      register: cp_log_dir_stat
+
+    - name: Fail if Check Point log directory does not exist
+      ansible.builtin.fail:
+        msg: "La ruta {{ cp_log_dir }} no existe en {{ inventory_hostname }}"
+      when: not cp_log_dir_stat.stat.exists
+
+    - name: Find previous day log files locally
+      ansible.builtin.shell: |
+        cd "{{ cp_log_dir }}"
+        ls -1 {{ backup_date }}* 2>/dev/null || true
+      register: previous_day_logs
+      changed_when: false
+
+    - name: Show previous day logs found locally
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backup_date: "{{ backup_date }}"
+          local_files_count: "{{ previous_day_logs.stdout_lines | length }}"
+          local_files: "{{ previous_day_logs.stdout_lines }}"
+
+    - name: Stop host when no previous day logs exist locally
+      ansible.builtin.meta: end_host
+      when: previous_day_logs.stdout_lines | length == 0
+
+    ###########################################################################
+    # Consultar en FTP qué archivos ya existen
+    ###########################################################################
+
+    - name: Create FTP list command file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: "_checkpoint_ftp_list_cmd"
+      register: ftp_list_command_file
+      no_log: true
+
+    - name: Write FTP list commands
+      ansible.builtin.copy:
+        dest: "{{ ftp_list_command_file.path }}"
+        mode: "0600"
+        content: |
+          user {{ ftp_user_effective }} {{ ftp_password_effective }}
+          binary
+          cd {{ ftp_remote_dir }}
+          nlist {{ backup_date }}*
+          bye
+      no_log: true
+
+    - name: Get existing previous day files from FTP server
+      ansible.builtin.shell: |
+        ftp -inv "{{ ftp_server }}" < "{{ ftp_list_command_file.path }}" \
+        | awk '/^{{ backup_date }}/ {print $0}'
+      register: remote_existing_logs
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Remove FTP list command file
+      ansible.builtin.file:
+        path: "{{ ftp_list_command_file.path }}"
+        state: absent
+      no_log: true
+      when: ftp_list_command_file.path is defined
+
+    - name: Normalize remote FTP existing file list
+      ansible.builtin.set_fact:
+        remote_existing_log_files: "{{ remote_existing_logs.stdout_lines | default([]) }}"
+
+    - name: Calculate files pending to upload
+      ansible.builtin.set_fact:
+        files_to_upload: "{{ previous_day_logs.stdout_lines | difference(remote_existing_log_files) }}"
+
+    - name: Show upload comparison
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backup_date: "{{ backup_date }}"
+          local_files_count: "{{ previous_day_logs.stdout_lines | length }}"
+          remote_existing_count: "{{ remote_existing_log_files | length }}"
+          pending_upload_count: "{{ files_to_upload | length }}"
+          remote_existing_files: "{{ remote_existing_log_files }}"
+          files_pending_to_upload: "{{ files_to_upload }}"
+
+    ###########################################################################
+    # Subir solo archivos faltantes
+    ###########################################################################
+
+    - name: Skip FTP upload when all files already exist
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: "Todos los archivos {{ backup_date }}* ya existen en el FTP. No se vuelve a subir nada."
+      when: files_to_upload | length == 0
+
+    - name: Create FTP upload command file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: "_checkpoint_ftp_upload_cmd"
+      register: ftp_upload_command_file
+      no_log: true
+      when: files_to_upload | length > 0
+
+    - name: Write FTP upload commands
+      ansible.builtin.copy:
+        dest: "{{ ftp_upload_command_file.path }}"
+        mode: "0600"
+        content: |
+          user {{ ftp_user_effective }} {{ ftp_password_effective }}
+          binary
+          cd {{ ftp_remote_dir }}
+          lcd {{ cp_log_dir }}
+{% for log_file in files_to_upload %}
+          put {{ log_file }}
+{% endfor %}
+          bye
+      no_log: true
+      when: files_to_upload | length > 0
+
+    - name: Upload only missing logs to FTP server
+      ansible.builtin.shell: |
+        ftp -inv "{{ ftp_server }}" < "{{ ftp_upload_command_file.path }}"
+      register: ftp_upload_result
+      changed_when: true
+      no_log: true
+      when: files_to_upload | length > 0
+
+    - name: Remove FTP upload command file
+      ansible.builtin.file:
+        path: "{{ ftp_upload_command_file.path }}"
+        state: absent
+      no_log: true
+      when:
+        - ftp_upload_command_file is defined
+        - ftp_upload_command_file.path is defined
+
+    - name: Validate FTP upload command result
+      ansible.builtin.fail:
+        msg: "Falló la transferencia FTP en {{ inventory_hostname }} hacia {{ ftp_server }}"
+      when:
+        - files_to_upload | length > 0
+        - ftp_upload_result.rc != 0
+
+    - name: Show FTP upload confirmation
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: "FTP ejecutado correctamente"
+          uploaded_files_count: "{{ files_to_upload | length }}"
+          uploaded_files: "{{ files_to_upload }}"
+      when:
+        - files_to_upload | length > 0
+        - ftp_upload_result.rc == 0
+
+    - name: Set FTP backup status
+      ansible.builtin.set_fact:
+        ftp_backup_ok: "{{ (files_to_upload | length == 0) or (ftp_upload_result is defined and ftp_upload_result.rc == 0) }}"
+
+    - name: Show FTP backup status
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          ftp_backup_ok: "{{ ftp_backup_ok }}"
+          files_uploaded_now: "{{ files_to_upload | length }}"
+          files_already_on_ftp: "{{ remote_existing_log_files | length }}"
+
+    ###########################################################################
+    # Borrado de logs más antiguos solo si el respaldo está confirmado
+    ###########################################################################
+
+    - name: Get oldest available log date
+      ansible.builtin.shell: |
+        cd "{{ cp_log_dir }}"
+        ls -1 \
+        | awk '/^[0-9]{4}-[0-9]{2}-[0-9]{2}/ {print substr($0,1,10)}' \
+        | sort -u \
+        | head -1
+      register: oldest_log_date
+      changed_when: false
+      when:
+        - delete_oldest_after_upload | bool
+        - ftp_backup_ok | bool
+
+    - name: Show oldest log date
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          oldest_log_date: "{{ oldest_log_date.stdout | default('NO ENCONTRADA') }}"
+      when:
+        - oldest_log_date is defined
+
+    - name: Stop deletion block when no oldest date was found
+      ansible.builtin.meta: end_host
+      when:
+        - delete_oldest_after_upload | bool
+        - ftp_backup_ok | bool
+        - oldest_log_date is defined
+        - oldest_log_date.stdout | length == 0
+
+    - name: Find files from oldest log date
+      ansible.builtin.shell: |
+        cd "{{ cp_log_dir }}"
+        ls -1 {{ oldest_log_date.stdout }}* 2>/dev/null || true
+      register: oldest_files_to_delete
+      changed_when: false
+      when:
+        - delete_oldest_after_upload | bool
+        - ftp_backup_ok | bool
+        - oldest_log_date is defined
+        - oldest_log_date.stdout | length > 0
+
+    - name: Show files selected for deletion
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          oldest_log_date: "{{ oldest_log_date.stdout }}"
+          dry_run_delete: "{{ dry_run_delete }}"
+          files_count: "{{ oldest_files_to_delete.stdout_lines | length }}"
+          files_to_delete: "{{ oldest_files_to_delete.stdout_lines }}"
+      when:
+        - oldest_files_to_delete is defined
+
+    - name: Delete files from oldest log date
+      ansible.builtin.shell: |
+        cd "{{ cp_log_dir }}"
+        rm -f {{ oldest_log_date.stdout }}*
+      register: delete_oldest_result
+      changed_when: true
+      when:
+        - delete_oldest_after_upload | bool
+        - ftp_backup_ok | bool
+        - oldest_files_to_delete is defined
+        - oldest_files_to_delete.stdout_lines | length > 0
+        - not dry_run_delete | bool
+
+    - name: Show deletion skipped by dry run
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: "DRY RUN activo, no se borró nada"
+          oldest_log_date: "{{ oldest_log_date.stdout }}"
+          files_that_would_be_deleted: "{{ oldest_files_to_delete.stdout_lines | default([]) }}"
+      when:
+        - oldest_files_to_delete is defined
+        - oldest_files_to_delete.stdout_lines | length > 0
+        - dry_run_delete | bool
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          backup_date: "{{ backup_date }}"
+          local_files_found: "{{ previous_day_logs.stdout_lines | length }}"
+          files_already_on_ftp: "{{ remote_existing_log_files | length }}"
+          files_uploaded_now: "{{ files_to_upload | length }}"
+          ftp_backup_ok: "{{ ftp_backup_ok }}"
+          oldest_date_found: "{{ oldest_log_date.stdout | default('N/A') }}"
+          dry_run_delete: "{{ dry_run_delete }}"
+          delete_executed: "{{ (not dry_run_delete | bool) and (oldest_files_to_delete is defined) and (oldest_files_to_delete.stdout_lines | length > 0) }}"
