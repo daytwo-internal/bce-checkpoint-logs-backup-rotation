@@ -103,18 +103,32 @@
           user {{ ftp_user_effective }} {{ ftp_password_effective }}
           binary
           cd {{ ftp_remote_dir }}
-          nlist {{ backup_date }}*
+          ls {{ backup_date }}*
           bye
       no_log: true
+
+#    - name: Get existing previous day files from FTP server
+#      ansible.builtin.shell: |
+#        ftp -inv "{{ ftp_server }}" < "{{ ftp_list_command_file.path }}" \
+#        | awk '/^{{ backup_date }}/ {print $0}'
+#      register: remote_existing_logs
+#      changed_when: false
+#      failed_when: false
+#      no_log: true
 
     - name: Get existing previous day files from FTP server
       ansible.builtin.shell: |
         ftp -inv "{{ ftp_server }}" < "{{ ftp_list_command_file.path }}" \
-        | awk '/^{{ backup_date }}/ {print $0}'
+        | tr -d '\r' \
+        | grep -Eo '{{ backup_date }}[^[:space:]]+' \
+        | sort -u || true
       register: remote_existing_logs
       changed_when: false
       failed_when: false
-      no_log: true
+
+    - name: Debug raw FTP list output
+      ansible.builtin.debug:
+        var: remote_existing_logs.stdout_lines
 
     - name: Remove FTP list command file
       ansible.builtin.file:
@@ -170,10 +184,10 @@
           binary
           cd {{ ftp_remote_dir }}
           lcd {{ cp_log_dir }}
-{% for log_file in files_to_upload %}
-          put {{ log_file }}
-{% endfor %}
-          bye
+          {% for log_file in files_to_upload %}
+                    put {{ log_file }}
+          {% endfor %}
+                    bye
       no_log: true
       when: files_to_upload | length > 0
 
