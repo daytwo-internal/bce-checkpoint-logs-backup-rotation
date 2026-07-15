@@ -91,6 +91,19 @@
       register: ftp_command_file
       no_log: true
 
+#    - name: Write FTP commands
+#      ansible.builtin.copy:
+#        dest: "{{ ftp_command_file.path }}"
+#        mode: "0600"
+#        content: |
+#          user {{ ftp_user_effective }} {{ ftp_password_effective }}
+#          binary
+#          cd {{ ftp_remote_dir }}
+#          prompt off
+#          mput {{ backup_date }}*
+#          bye
+#      no_log: true
+
     - name: Write FTP commands
       ansible.builtin.copy:
         dest: "{{ ftp_command_file.path }}"
@@ -99,14 +112,23 @@
           user {{ ftp_user_effective }} {{ ftp_password_effective }}
           binary
           cd {{ ftp_remote_dir }}
-          prompt off
-          mput {{ backup_date }}*
+          lcd {{ cp_log_dir }}
+    {% for log_file in previous_day_logs.stdout_lines %}
+          put {{ log_file }}
+    {% endfor %}
           bye
       no_log: true
 
+#    - name: Upload previous day logs to FTP server
+#      ansible.builtin.shell: |
+#        cd "{{ cp_log_dir }}"
+#        ftp -inv "{{ ftp_server }}" < "{{ ftp_command_file.path }}"
+#      register: ftp_upload_result
+#      changed_when: true
+#      no_log: true
+
     - name: Upload previous day logs to FTP server
       ansible.builtin.shell: |
-        cd "{{ cp_log_dir }}"
         ftp -inv "{{ ftp_server }}" < "{{ ftp_command_file.path }}"
       register: ftp_upload_result
       changed_when: true
