@@ -36,7 +36,7 @@
           - nbu_api_key | length > 0
         fail_msg: "No llegó el API Key de Veritas desde AAP. Validar la credencial asociada al Job Template."
         success_msg: "API Key de Veritas recibido desde AAP."
-      no_log: true
+      
 
     - name: Calculate backup search start time
       ansible.builtin.shell: |
@@ -59,14 +59,22 @@
           backup_start_time: "{{ nbu_backup_start_time }}"
           paths_to_validate: "{{ checkpoint_backup_paths }}"
 
+######
+
+    - name: Build NetBackup catalog filter
+      ansible.builtin.set_fact:
+        nbu_catalog_filter: >-
+          clientName eq '{{ nbu_client_name }}' and policyName eq '{{ nbu_policy_name }}' and policyType eq '{{ nbu_policy_type }}' and backupTime ge {{ nbu_backup_start_time }}
+
+    - name: Show NetBackup catalog filter
+      ansible.builtin.debug:
+        msg:
+          filter: "{{ nbu_catalog_filter }}"
+          encoded_filter: "{{ nbu_catalog_filter | urlencode }}"
+
     - name: Query NetBackup catalog images for FTP server
       ansible.builtin.uri:
-        url: >-
-          {{ nbu_base_url }}/catalog/images?filter=clientName eq '{{ nbu_client_name }}'
-          and policyName eq '{{ nbu_policy_name }}'
-          and policyType eq '{{ nbu_policy_type }}'
-          and backupTime ge {{ nbu_backup_start_time }}
-          &page[limit]=100
+        url: "{{ nbu_base_url }}/catalog/images?filter={{ nbu_catalog_filter | urlencode }}&page%5Blimit%5D=100"
         method: GET
         headers:
           Authorization: "{{ nbu_api_key }}"
@@ -77,7 +85,11 @@
           - 200
           - 404
       register: nbu_catalog_images
-      no_log: true
+
+
+#######
+
+      
 
     - name: Normalize NetBackup image list
       ansible.builtin.set_fact:
@@ -128,7 +140,7 @@
           - 404
       loop: "{{ nbu_backup_ids }}"
       register: nbu_image_details
-      no_log: true
+      
 
     - name: Convert image details to searchable text
       ansible.builtin.set_fact:
