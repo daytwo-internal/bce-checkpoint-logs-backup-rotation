@@ -1,0 +1,180 @@
+---
+- name: Verify Check Point FTP folders are protected in Veritas NetBackup
+  hosts: netbackup_api
+  gather_facts: false
+
+  vars:
+    nbu_api_key: "{{ lookup('env', 'NBU_API_KEY') }}"
+
+    nbu_master_server: "bceqms01"
+    nbu_api_port: 1556
+    nbu_validate_certs: false
+
+    nbu_client_name: "bceqsrvftp"
+    nbu_policy_name: "p-srvftp-fw"
+    nbu_policy_type: "MS-Windows"
+
+    # Ventana de búsqueda de imágenes recientes.
+    # Para validar el backup diario, 48 horas suele ser más seguro que solo 24.
+    nbu_lookback_hours: 96
+
+    nbu_base_url: "https://{{ nbu_master_server }}:{{ nbu_api_port }}/netbackup"
+
+    checkpoint_backup_paths:
+      - name: "SMARTCONSOLE UIO"
+        path: 'D:\CheckpointLOG\SMARTCONSOLE UIO'
+      - name: "SMARTCONSOLE GYE"
+        path: 'D:\CheckpointLOG\SMARTCONSOLE GYE'
+      - name: "SMARTEVENT UIO"
+        path: 'D:\CheckpointLOG\SMARTEVENT UIO'
+
+  tasks:
+    - name: Validate NetBackup API key from AAP
+      ansible.builtin.assert:
+        that:
+          - nbu_api_key is defined
+          - nbu_api_key | length > 0
+        fail_msg: "No llegó el API Key de Veritas desde AAP. Validar la credencial asociada al Job Template."
+        success_msg: "API Key de Veritas recibido desde AAP."
+      no_log: true
+
+    - name: Calculate backup search start time
+      ansible.builtin.shell: |
+        date -u -d "{{ nbu_lookback_hours }} hours ago" +"%Y-%m-%dT%H:%M:%SZ"
+      register: nbu_start_time_result
+      changed_when: false
+
+    - name: Set backup start time fact
+      ansible.builtin.set_fact:
+        nbu_backup_start_time: "{{ nbu_start_time_result.stdout }}"
+
+    - name: Show NetBackup query context
+      ansible.builtin.debug:
+        msg:
+          master_server: "{{ nbu_master_server }}"
+          client_name: "{{ nbu_client_name }}"
+          policy_name: "{{ nbu_policy_name }}"
+          policy_type: "{{ nbu_policy_type }}"
+          lookback_hours: "{{ nbu_lookback_hours }}"
+          backup_start_time: "{{ nbu_backup_start_time }}"
+          paths_to_validate: "{{ checkpoint_backup_paths }}"
+
+    - name: Query NetBackup catalog images for FTP server
+      ansible.builtin.uri:
+        url: >-
+          {{ nbu_base_url }}/catalog/images?filter=clientName eq '{{ nbu_client_name }}'
+          and policyName eq '{{ nbu_policy_name }}'
+          and policyType eq '{{ nbu_policy_type }}'
+          and backupTime ge {{ nbu_backup_start_time }}
+          &page[limit]=100
+        method: GET
+        headers:
+          Authorization: "{{ nbu_api_key }}"
+          Accept: "application/vnd.netbackup+json;version=1.0"
+        validate_certs: "{{ nbu_validate_certs }}"
+        return_content: true
+        status_code:
+          - 200
+          - 404
+      register: nbu_catalog_images
+      no_log: true
+
+    - name: Normalize NetBackup image list
+      ansible.builtin.set_fact:
+        nbu_images: "{{ nbu_catalog_images.json.data | default([]) }}"
+
+    - name: Show NetBackup images summary
+      ansible.builtin.debug:
+        msg:
+          images_found: "{{ nbu_images | length }}"
+          note: >-
+            Si images_found es mayor a 0, existen imágenes de backup recientes para el cliente/política consultados.
+
+    - name: Fail if no NetBackup images were found
+      ansible.builtin.fail:
+        msg: >-
+          No se encontraron imágenes de backup recientes en NetBackup para el cliente {{ nbu_client_name }},
+          política {{ nbu_policy_name }}, dentro de las últimas {{ nbu_lookback_hours }} horas.
+      when: nbu_images | length == 0
+
+    - name: Build list of backup IDs found
+      ansible.builtin.set_fact:
+        nbu_backup_ids: "{{ nbu_images | map(attribute='id') | list }}"
+
+    - name: Show backup IDs found
+      ansible.builtin.debug:
+        msg:
+          backup_ids: "{{ nbu_backup_ids }}"
+
+    ###########################################################################
+    # Validación base:
+    # Primero confirma que existe backup reciente del cliente/política.
+    #
+    # Validación más fina:
+    # Luego intenta consultar detalle por backupId para verificar paths.
+    ###########################################################################
+
+    - name: Query details for each NetBackup image
+      ansible.builtin.uri:
+        url: "{{ nbu_base_url }}/catalog/images/{{ item }}"
+        method: GET
+        headers:
+          Authorization: "{{ nbu_api_key }}"
+          Accept: "application/vnd.netbackup+json;version=1.0"
+        validate_certs: "{{ nbu_validate_certs }}"
+        return_content: true
+        status_code:
+          - 200
+          - 404
+      loop: "{{ nbu_backup_ids }}"
+      register: nbu_image_details
+      no_log: true
+
+    - name: Convert image details to searchable text
+      ansible.builtin.set_fact:
+        nbu_image_details_text: "{{ nbu_image_details.results | to_json }}"
+
+    - name: Evaluate each required Check Point backup path
+      ansible.builtin.set_fact:
+        checkpoint_path_validation: >-
+          {{
+            checkpoint_path_validation | default([]) +
+            [
+              {
+                'name': item.name,
+                'path': item.path,
+                'found_in_backup_details': (item.path | lower) in (nbu_image_details_text | lower)
+              }
+            ]
+          }}
+      loop: "{{ checkpoint_backup_paths }}"
+
+    - name: Show Check Point path validation result
+      ansible.builtin.debug:
+        msg:
+          client: "{{ nbu_client_name }}"
+          policy: "{{ nbu_policy_name }}"
+          images_found: "{{ nbu_images | length }}"
+          validation: "{{ checkpoint_path_validation }}"
+
+    - name: Fail if any Check Point path was not found in NetBackup image details
+      ansible.builtin.fail:
+        msg: >-
+          Se encontraron imágenes de backup para {{ nbu_client_name }}, pero una o más rutas no aparecieron
+          en el detalle retornado por la API. Validar en NetBackup si la API expone el file list o si se requiere
+          otro endpoint para búsqueda de archivos/carpetas dentro de la imagen. Resultado: {{ checkpoint_path_validation }}
+      when: >
+        checkpoint_path_validation
+        | selectattr('found_in_backup_details', 'equalto', false)
+        | list
+        | length > 0
+
+    - name: Final NetBackup backup validation summary
+      ansible.builtin.debug:
+        msg:
+          status: "OK"
+          client: "{{ nbu_client_name }}"
+          policy: "{{ nbu_policy_name }}"
+          backup_images_found: "{{ nbu_images | length }}"
+          backup_ids: "{{ nbu_backup_ids }}"
+          checkpoint_paths_validated: "{{ checkpoint_path_validation }}"
