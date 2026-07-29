@@ -10,6 +10,11 @@
     #backup_date: "{{ lookup('pipe', 'date -d yesterday +%F') }}"
     backup_date: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d yesterday +%F') }}"
     backup_next_date: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d today +%F') }}"
+
+    backup_date_touch: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d yesterday +%Y%m%d0000.00') }}"
+    backup_next_date_touch: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d today +%Y%m%d0000.00') }}"
+
+
     # Ruta de logs en las consolas Check Point
     cp_log_dir: "/opt/CPsuite-R82/fw1/log"
 
@@ -69,24 +74,25 @@
         msg: "La ruta {{ cp_log_dir }} no existe en {{ inventory_hostname }}"
       when: not cp_log_dir_stat.stat.exists
 
-#    - name: Find previous day log files locally
-#      ansible.builtin.shell: |
-#        cd "{{ cp_log_dir }}"
-#        ls -1 {{ backup_date }}* 2>/dev/null || true
-#      register: previous_day_logs
-#      changed_when: false
 
     - name: Find previous day log files locally by name or modification date
       ansible.builtin.shell: |
         cd "{{ cp_log_dir }}"
 
-        find . -maxdepth 1 -type f \
-          \( \
-            -name "{{ backup_date }}*" \
-            -o \
-            \( -newermt "{{ backup_date }} 00:00:00" ! -newermt "{{ backup_next_date }} 00:00:00" \) \
-          \) \
-          -printf "%f\n" | sort -u
+        start_ref="/tmp/chkp_start_{{ backup_date }}_$$"
+        end_ref="/tmp/chkp_end_{{ backup_next_date }}_$$"
+
+        trap 'rm -f "$start_ref" "$end_ref"' EXIT
+
+        touch -t "{{ backup_date_touch }}" "$start_ref"
+        touch -t "{{ backup_next_date_touch }}" "$end_ref"
+
+        (
+          ls -1 {{ backup_date }}* 2>/dev/null || true
+
+          find . -type f -newer "$start_ref" ! -newer "$end_ref" 2>/dev/null \
+            | awk -F/ 'NF==2 {print $2}'
+        ) | sort -u
       register: previous_day_logs
       changed_when: false
 
@@ -95,6 +101,10 @@
         msg:
           host: "{{ inventory_hostname }}"
           backup_date: "{{ backup_date }}"
+          backup_next_date: "{{ backup_next_date }}"
+          selection_criteria:
+            - "Nombre inicia con {{ backup_date }}"
+            - "Archivo modificado durante {{ backup_date }}"
           local_files_count: "{{ previous_day_logs.stdout_lines | length }}"
           local_files: "{{ previous_day_logs.stdout_lines }}"
 
