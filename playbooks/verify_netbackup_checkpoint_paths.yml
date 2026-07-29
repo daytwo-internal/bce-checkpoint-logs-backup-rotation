@@ -211,21 +211,20 @@
 #          backup_ids: "{{ nbu_backup_ids }}"
 #          checkpoint_paths_validated: "{{ checkpoint_path_validation }}"
 
-- name: Final NetBackup backup validation summary
-  ansible.builtin.debug:
-    msg:
-      status: "OK"
-      validation_result: "Se encontraron imágenes recientes de backup en NetBackup"
-      validation_rule: "images_found > 0"
-      client: "{{ nbu_client_name }}"
-      policy: "{{ nbu_policy_name }}"
-      policy_type: "{{ nbu_policy_type }}"
-      lookback_hours: "{{ nbu_lookback_hours }}"
-      backup_images_found: "{{ nbu_images | length }}"
-      backup_ids: "{{ nbu_backup_ids }}"
-      path_level_validation: "WARNING_ONLY"
-      path_level_validation_note: >-
-        La validación de rutas es informativa porque el endpoint consultado puede
-        no exponer el listado completo de archivos/carpetas respaldadas.
-      checkpoint_paths_checked: "{{ checkpoint_path_validation }}"
-      
+    - name: Final NetBackup backup validation summary
+      ansible.builtin.debug:
+        msg:
+          status: "OK"
+          validation_result: "Se encontraron imágenes recientes de backup en NetBackup"
+          validation_rule: "images_found > 0"
+          client: "{{ nbu_client_name }}"
+          policy: "{{ nbu_policy_name }}"
+          policy_type: "{{ nbu_policy_type }}"
+          lookback_hours: "{{ nbu_lookback_hours }}"
+          backup_images_found: "{{ nbu_images | length }}"
+          backup_ids: "{{ nbu_backup_ids }}"
+          path_level_validation: "WARNING_ONLY"
+          path_level_validation_note: >-
+            La validación de rutas es informativa porque el endpoint consultado puede
+            no exponer el listado completo de archivos/carpetas respaldadas.
+          checkpoint_paths_checked: "{{ checkpoint_path_validation }}"
