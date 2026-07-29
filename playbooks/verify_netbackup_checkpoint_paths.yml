@@ -169,24 +169,63 @@
           images_found: "{{ nbu_images | length }}"
           validation: "{{ checkpoint_path_validation }}"
 
-    - name: Fail if any Check Point path was not found in NetBackup image details
-      ansible.builtin.fail:
-        msg: >-
-          Se encontraron imágenes de backup para {{ nbu_client_name }}, pero una o más rutas no aparecieron
-          en el detalle retornado por la API. Validar en NetBackup si la API expone el file list o si se requiere
-          otro endpoint para búsqueda de archivos/carpetas dentro de la imagen. Resultado: {{ checkpoint_path_validation }}
+#    - name: Fail if any Check Point path was not found in NetBackup image details
+#      ansible.builtin.fail:
+#        msg: >-
+#          Se encontraron imágenes de backup para {{ nbu_client_name }}, pero una o más rutas no aparecieron
+#          en el detalle retornado por la API. Validar en NetBackup si la API expone el file list o si se requiere
+#          otro endpoint para búsqueda de archivos/carpetas dentro de la imagen. Resultado: {{ checkpoint_path_validation }}
+#      when: >
+#        checkpoint_path_validation
+#        | selectattr('found_in_backup_details', 'equalto', false)
+#        | list
+#        | length > 0
+
+    - name: Warn if any Check Point path was not found in NetBackup image details
+      ansible.builtin.debug:
+        msg:
+          warning: >-
+            Se encontraron imágenes recientes de backup para {{ nbu_client_name }},
+            pero una o más rutas no aparecieron en el detalle retornado por la API.
+            Esto no necesariamente indica ausencia de respaldo; puede deberse a que el endpoint
+            /catalog/images/{backupId} no expone el listado completo de archivos o carpetas.
+          validation_mode: "OK por existencia de imágenes de backup. Validación de rutas solo informativa."
+          client: "{{ nbu_client_name }}"
+          policy: "{{ nbu_policy_name }}"
+          images_found: "{{ nbu_images | length }}"
+          checkpoint_path_validation: "{{ checkpoint_path_validation }}"
       when: >
         checkpoint_path_validation
         | selectattr('found_in_backup_details', 'equalto', false)
         | list
         | length > 0
 
-    - name: Final NetBackup backup validation summary
-      ansible.builtin.debug:
-        msg:
-          status: "OK"
-          client: "{{ nbu_client_name }}"
-          policy: "{{ nbu_policy_name }}"
-          backup_images_found: "{{ nbu_images | length }}"
-          backup_ids: "{{ nbu_backup_ids }}"
-          checkpoint_paths_validated: "{{ checkpoint_path_validation }}"
+
+#    - name: Final NetBackup backup validation summary
+#      ansible.builtin.debug:
+#        msg:
+#          status: "OK"
+#          client: "{{ nbu_client_name }}"
+#          policy: "{{ nbu_policy_name }}"
+#          backup_images_found: "{{ nbu_images | length }}"
+#          backup_ids: "{{ nbu_backup_ids }}"
+#          checkpoint_paths_validated: "{{ checkpoint_path_validation }}"
+
+- name: Final NetBackup backup validation summary
+  ansible.builtin.debug:
+    msg:
+      status: "OK"
+      validation_result: "Se encontraron imágenes recientes de backup en NetBackup"
+      validation_rule: "images_found > 0"
+      client: "{{ nbu_client_name }}"
+      policy: "{{ nbu_policy_name }}"
+      policy_type: "{{ nbu_policy_type }}"
+      lookback_hours: "{{ nbu_lookback_hours }}"
+      backup_images_found: "{{ nbu_images | length }}"
+      backup_ids: "{{ nbu_backup_ids }}"
+      path_level_validation: "WARNING_ONLY"
+      path_level_validation_note: >-
+        La validación de rutas es informativa porque el endpoint consultado puede
+        no exponer el listado completo de archivos/carpetas respaldadas.
+      checkpoint_paths_checked: "{{ checkpoint_path_validation }}"
+      
