@@ -1,0 +1,189 @@
+---
+- name: Cleanup Check Point FTP logs directly from AAP
+  hosts: ftp_cleanup_api
+  gather_facts: false
+
+  vars:
+#    ftp_server: "172.23.46.29"
+#    ftp_port: 21
+#    ftp_remote_dir: "/"
+
+    ftp_user_effective: "{{ lookup('env', 'CHKP_FTP_USER') }}"
+    ftp_password_effective: "{{ lookup('env', 'CHKP_FTP_PASSWORD') }}"
+
+    keep_date_1: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d yesterday +%F') }}"
+    keep_date_2: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d \"2 days ago\" +%F') }}"
+
+    ftp_keep_dates:
+      - "{{ keep_date_1 }}"
+      - "{{ keep_date_2 }}"
+
+    ftp_cleanup_enabled: false
+    dry_run_ftp_cleanup: true
+
+  tasks:
+    - name: Show FTP cleanup context
+      ansible.builtin.debug:
+        msg:
+          execution_mode: "AAP direct to FTP"
+          ftp_server: "{{ ftp_server }}"
+          ftp_remote_dir: "{{ ftp_remote_dir }}"
+          keep_dates: "{{ ftp_keep_dates }}"
+          ftp_cleanup_enabled: "{{ ftp_cleanup_enabled }}"
+          dry_run_ftp_cleanup: "{{ dry_run_ftp_cleanup }}"
+
+    - name: Validate FTP credentials from AAP
+      ansible.builtin.assert:
+        that:
+          - ftp_user_effective is defined
+          - ftp_user_effective | length > 0
+          - ftp_password_effective is defined
+          - ftp_password_effective | length > 0
+        fail_msg: "No llegaron las credenciales FTP desde AAP."
+        success_msg: "Credenciales FTP recibidas desde AAP."
+      no_log: true
+
+    - name: List FTP files and optionally delete files outside retention
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import os
+        import re
+        import sys
+        import json
+        import ftplib
+
+        ftp_server = os.environ["FTP_SERVER"]
+        ftp_port = int(os.environ.get("FTP_PORT", "21"))
+        ftp_user = os.environ["FTP_USER"]
+        ftp_password = os.environ["FTP_PASSWORD"]
+        ftp_remote_dir = os.environ.get("FTP_REMOTE_DIR", "/")
+        keep_dates = os.environ["FTP_KEEP_DATES"].split(",")
+        cleanup_enabled = os.environ["FTP_CLEANUP_ENABLED"].lower() == "true"
+        dry_run = os.environ["FTP_DRY_RUN"].lower() == "true"
+
+        result = {
+            "ftp_server": ftp_server,
+            "ftp_remote_dir": ftp_remote_dir,
+            "keep_dates": keep_dates,
+            "cleanup_enabled": cleanup_enabled,
+            "dry_run": dry_run,
+            "remote_dated_files": [],
+            "files_to_delete": [],
+            "deleted_files": [],
+            "delete_errors": []
+        }
+
+        try:
+            ftp = ftplib.FTP()
+            ftp.connect(ftp_server, ftp_port, timeout=60)
+            ftp.login(ftp_user, ftp_password)
+            ftp.cwd(ftp_remote_dir)
+
+            lines = []
+            ftp.retrlines("LIST", lines.append)
+
+            dated_files = []
+            for line in lines:
+                matches = re.findall(r"\b\d{4}-\d{2}-\d{2}\S+", line)
+                dated_files.extend(matches)
+
+            dated_files = sorted(set(dated_files))
+            files_to_delete = [
+                filename for filename in dated_files
+                if filename[0:10] not in keep_dates
+            ]
+
+            result["remote_dated_files"] = dated_files
+            result["files_to_delete"] = files_to_delete
+
+            if cleanup_enabled and not dry_run:
+                for filename in files_to_delete:
+                    try:
+                        ftp.delete(filename)
+                        result["deleted_files"].append(filename)
+                    except Exception as exc:
+                        result["delete_errors"].append({
+                            "file": filename,
+                            "error": str(exc)
+                        })
+
+            ftp.quit()
+
+            print(json.dumps(result, indent=2))
+
+            if result["delete_errors"]:
+                sys.exit(2)
+
+        except Exception as exc:
+            print(json.dumps({
+                "error": str(exc),
+                "ftp_server": ftp_server,
+                "ftp_remote_dir": ftp_remote_dir
+            }, indent=2))
+            sys.exit(1)
+        PY
+      register: ftp_cleanup_raw
+      changed_when: >
+        (not dry_run_ftp_cleanup | bool) and
+        (ftp_cleanup_enabled | bool) and
+        ((ftp_cleanup_raw.stdout | from_json).deleted_files | length > 0)
+      environment:
+        FTP_SERVER: "{{ ftp_server }}"
+        FTP_PORT: "{{ ftp_port }}"
+        FTP_USER: "{{ ftp_user_effective }}"
+        FTP_PASSWORD: "{{ ftp_password_effective }}"
+        FTP_REMOTE_DIR: "{{ ftp_remote_dir }}"
+        FTP_KEEP_DATES: "{{ ftp_keep_dates | join(',') }}"
+        FTP_CLEANUP_ENABLED: "{{ (ftp_cleanup_enabled | bool) | ternary('true', 'false') }}"
+        FTP_DRY_RUN: "{{ (dry_run_ftp_cleanup | bool) | ternary('true', 'false') }}"
+
+    - name: Normalize FTP cleanup result
+      ansible.builtin.set_fact:
+        ftp_cleanup_result: "{{ ftp_cleanup_raw.stdout | from_json }}"
+
+    - name: Show FTP retention decision
+      ansible.builtin.debug:
+        msg:
+          ftp_server: "{{ ftp_cleanup_result.ftp_server }}"
+          ftp_remote_dir: "{{ ftp_cleanup_result.ftp_remote_dir }}"
+          keep_dates: "{{ ftp_cleanup_result.keep_dates }}"
+          remote_dated_files_count: "{{ ftp_cleanup_result.remote_dated_files | length }}"
+          files_to_delete_count: "{{ ftp_cleanup_result.files_to_delete | length }}"
+          files_to_delete: "{{ ftp_cleanup_result.files_to_delete }}"
+          deleted_files_count: "{{ ftp_cleanup_result.deleted_files | length }}"
+          deleted_files: "{{ ftp_cleanup_result.deleted_files }}"
+          dry_run: "{{ ftp_cleanup_result.dry_run }}"
+
+    - name: Stop cleanup when there are no files to delete
+      ansible.builtin.meta: end_host
+      when: ftp_cleanup_result.files_to_delete | length == 0
+
+    - name: Stop cleanup when ftp_cleanup_enabled is false
+      ansible.builtin.fail:
+        msg: >-
+          Limpieza FTP bloqueada por seguridad. Para habilitarla, ejecutar con
+          ftp_cleanup_enabled=true. Archivos candidatos a eliminar:
+          {{ ftp_cleanup_result.files_to_delete }}
+      when:
+        - not ftp_cleanup_enabled | bool
+
+    - name: Show dry run result
+      ansible.builtin.debug:
+        msg:
+          status: "DRY RUN activo. No se eliminó nada del FTP."
+          keep_dates: "{{ ftp_keep_dates }}"
+          files_that_would_be_deleted: "{{ ftp_cleanup_result.files_to_delete }}"
+      when:
+        - ftp_cleanup_enabled | bool
+        - dry_run_ftp_cleanup | bool
+
+    - name: Final FTP cleanup summary
+      ansible.builtin.debug:
+        msg:
+          status: "FTP cleanup completed"
+          ftp_server: "{{ ftp_server }}"
+          ftp_remote_dir: "{{ ftp_remote_dir }}"
+          keep_dates: "{{ ftp_keep_dates }}"
+          deleted_files_count: "{{ ftp_cleanup_result.deleted_files | length }}"
+          deleted_files: "{{ ftp_cleanup_result.deleted_files }}"
+          dry_run_ftp_cleanup: "{{ dry_run_ftp_cleanup }}"
