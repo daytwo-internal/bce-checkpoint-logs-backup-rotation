@@ -16,7 +16,7 @@
 
     # Ventana de búsqueda de imágenes recientes.
     # Para validar el backup diario, 48 horas suele ser más seguro que solo 24.
-    nbu_lookback_hours: 96
+    nbu_lookback_hours: 48
 
     nbu_base_url: "https://{{ nbu_master_server }}:{{ nbu_api_port }}/netbackup"
 

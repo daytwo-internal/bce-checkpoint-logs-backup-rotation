@@ -1,0 +1,219 @@
+---
+- name: Cleanup Check Point FTP logs after Veritas backup validation
+  hosts: checkpoint_log_consoles
+  gather_facts: false
+  become: false
+
+  vars:
+    ftp_server: "172.23.46.29"
+    ftp_remote_dir: "/"
+
+
+    # Credenciales FTP inyectadas desde AAP Credential Type
+    ftp_user_effective: "{{ lookup('env', 'CHKP_FTP_USER') }}"
+    ftp_password_effective: "{{ lookup('env', 'CHKP_FTP_PASSWORD') }}"
+
+    # Mantener únicamente:
+    # - día anterior
+    # - día anterior - 1
+    keep_date_1: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d yesterday +%F') }}"
+    keep_date_2: "{{ lookup('pipe', 'TZ=America/Guayaquil date -d \"2 days ago\" +%F') }}"
+
+    ftp_keep_dates:
+      - "{{ keep_date_1 }}"
+      - "{{ keep_date_2 }}"
+
+    # Seguridad operativa
+    # Primero probar con:
+    # ftp_cleanup_enabled=true
+    # dry_run_ftp_cleanup=true
+    ftp_cleanup_enabled: true
+    dry_run_ftp_cleanup: true
+
+  tasks:
+    - name: Show FTP cleanup context
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          ftp_server: "{{ ftp_server }}"
+          ftp_remote_dir: "{{ ftp_remote_dir }}"
+          keep_date_1: "{{ keep_date_1 }}"
+          keep_date_2: "{{ keep_date_2 }}"
+          ftp_keep_dates: "{{ ftp_keep_dates }}"
+          ftp_cleanup_enabled: "{{ ftp_cleanup_enabled }}"
+          dry_run_ftp_cleanup: "{{ dry_run_ftp_cleanup }}"
+
+    - name: Validate FTP credentials from AAP
+      ansible.builtin.assert:
+        that:
+          - ftp_user_effective is defined
+          - ftp_user_effective | length > 0
+          - ftp_password_effective is defined
+          - ftp_password_effective | length > 0
+        fail_msg: >-
+          No llegaron las credenciales FTP desde AAP para {{ inventory_hostname }}.
+          Validar que el Job Template tenga asociada la credencial FTP correcta.
+        success_msg: "Credenciales FTP recibidas desde AAP para {{ inventory_hostname }}"
+      no_log: true
+
+    ###########################################################################
+    # Listar archivos remotos en FTP
+    ###########################################################################
+
+    - name: Create FTP directory list command file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: "_checkpoint_ftp_cleanup_list_cmd"
+      register: ftp_cleanup_list_command_file
+      no_log: true
+
+    - name: Write FTP directory list commands
+      ansible.builtin.copy:
+        dest: "{{ ftp_cleanup_list_command_file.path }}"
+        mode: "0600"
+        content: |
+          user {{ ftp_user_effective }} {{ ftp_password_effective }}
+          binary
+          cd {{ ftp_remote_dir }}
+          dir
+          bye
+      no_log: true
+
+    - name: Get dated files from FTP server
+      ansible.builtin.shell: |
+        ftp -inv "{{ ftp_server }}" < "{{ ftp_cleanup_list_command_file.path }}" \
+        | tr -d '\r' \
+        | grep -Eo '[0-9]{4}-[0-9]{2}-[0-9]{2}[^[:space:]]+' \
+        | sort -u || true
+      register: ftp_remote_dated_files
+      changed_when: false
+      failed_when: false
+
+    - name: Remove FTP directory list command file
+      ansible.builtin.file:
+        path: "{{ ftp_cleanup_list_command_file.path }}"
+        state: absent
+      no_log: true
+      when: ftp_cleanup_list_command_file.path is defined
+
+    ###########################################################################
+    # Seleccionar archivos a eliminar
+    # Solo se consideran archivos con fecha en el nombre:
+    # 2026-07-28_...
+    # 2026-07-28__api.elg.1
+    ###########################################################################
+
+    - name: Initialize remote files to delete
+      ansible.builtin.set_fact:
+        ftp_remote_files_to_delete: []
+
+    - name: Select remote files outside FTP retention window
+      ansible.builtin.set_fact:
+        ftp_remote_files_to_delete: "{{ ftp_remote_files_to_delete + [item] }}"
+      loop: "{{ ftp_remote_dated_files.stdout_lines | default([]) }}"
+      when:
+        - item[0:10] not in ftp_keep_dates
+
+    - name: Show FTP retention decision
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          keep_dates: "{{ ftp_keep_dates }}"
+          remote_dated_files_count: "{{ ftp_remote_dated_files.stdout_lines | default([]) | length }}"
+          remote_dated_files: "{{ ftp_remote_dated_files.stdout_lines | default([]) }}"
+          files_to_delete_count: "{{ ftp_remote_files_to_delete | length }}"
+          files_to_delete: "{{ ftp_remote_files_to_delete }}"
+
+    - name: Stop cleanup when there are no files to delete
+      ansible.builtin.meta: end_host
+      when: ftp_remote_files_to_delete | length == 0
+
+    - name: Stop cleanup when ftp_cleanup_enabled is false
+      ansible.builtin.fail:
+        msg: >-
+          Limpieza FTP bloqueada por seguridad.
+          Para habilitarla, ejecutar con ftp_cleanup_enabled=true.
+          Archivos candidatos a eliminar: {{ ftp_remote_files_to_delete }}
+      when:
+        - not ftp_cleanup_enabled | bool
+
+    ###########################################################################
+    # Dry Run
+    ###########################################################################
+
+    - name: Show dry run cleanup result
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: "DRY RUN activo. No se eliminó nada del FTP."
+          keep_dates: "{{ ftp_keep_dates }}"
+          files_that_would_be_deleted: "{{ ftp_remote_files_to_delete }}"
+      when:
+        - ftp_cleanup_enabled | bool
+        - dry_run_ftp_cleanup | bool
+
+    - name: Stop after dry run
+      ansible.builtin.meta: end_host
+      when:
+        - ftp_cleanup_enabled | bool
+        - dry_run_ftp_cleanup | bool
+
+    ###########################################################################
+    # Eliminación real
+    ###########################################################################
+
+    - name: Create FTP delete command file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: "_checkpoint_ftp_delete_cmd"
+      register: ftp_delete_command_file
+      no_log: true
+      when:
+        - ftp_cleanup_enabled | bool
+        - not dry_run_ftp_cleanup | bool
+
+    - name: Write FTP delete commands
+      ansible.builtin.copy:
+        dest: "{{ ftp_delete_command_file.path }}"
+        mode: "0600"
+        content: |
+          user {{ ftp_user_effective }} {{ ftp_password_effective }}
+          binary
+          cd {{ ftp_remote_dir }}
+          {% for file_to_delete in ftp_remote_files_to_delete %}
+          delete {{ file_to_delete }}
+          {% endfor %}
+          bye
+      no_log: true
+      when:
+        - ftp_cleanup_enabled | bool
+        - not dry_run_ftp_cleanup | bool
+
+    - name: Delete old files from FTP server
+      ansible.builtin.shell: |
+        ftp -inv "{{ ftp_server }}" < "{{ ftp_delete_command_file.path }}"
+      register: ftp_delete_result
+      changed_when: true
+      no_log: true
+      when:
+        - ftp_cleanup_enabled | bool
+        - not dry_run_ftp_cleanup | bool
+
+    - name: Remove FTP delete command file
+      ansible.builtin.file:
+        path: "{{ ftp_delete_command_file.path }}"
+        state: absent
+      no_log: true
+      when:
+        - ftp_delete_command_file is defined
+        - ftp_delete_command_file.path is defined
+
+    - name: Final FTP cleanup summary
+      ansible.builtin.debug:
+        msg:
+          host: "{{ inventory_hostname }}"
+          status: "FTP cleanup completed"
+          keep_dates: "{{ ftp_keep_dates }}"
+          deleted_files_count: "{{ ftp_remote_files_to_delete | length }}"
+          deleted_files: "{{ ftp_remote_files_to_delete }}"
+          dry_run_ftp_cleanup: "{{ dry_run_ftp_cleanup }}"
